@@ -1,0 +1,484 @@
+mcrouter 速览
+
+key规则:
+
+0.                                      /region/cluster/foo:key|#|etc
+1.Full key:                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2.Routing prefix:                       ^^^^^^^^^^^^^^^^			
+3.Routing key:                                          ^^^^^^^				
+4.Key with stripped routing prefix:                     ^^^^^^^^^^^^^			
+
+1.完整的key，mcrouter可识别，memcached不识别
+2.路由key，可用于datacenter分离，mcrouter识别，memcached不识别
+3.实际hash的key
+4.应用程序中set的key
+
+
+pool，一组memcached instances，有如下属性：
+1、servers:
+"servers": [ "127.0.0.1:12345", "[::1]:5000", "memcached123.somedomain:4000" ]
+2、hash：
+ch3 (default); crc32 or wch3
+3、protocol:
+"ascii" (default) or "umbrella"
+4、keep_routing_prefix:
+是否保持Routing prefix。default false
+当mcrouter同mcrouter通信时时，一般需要设置为true
+
+routes
+routes有一系列route组成，是一个路由规则集，有如下属性：
+aliases，路由前缀，如/regionA/clusterA/，/regionA/clusterB/
+route，该前缀条件下得路由规则
+
+每个route都有一个type，表示路由类型，还有一系列其它属性。
+type： 比如说HashRoute，LatestRoute，AllSyncRoute等
+
+
+{
+   "route": /* some route handle tree */
+}
+等价于
+{
+   "routes": [
+     {
+       "aliases": [ /* default routing prefix specified on mcrouter command line */ ],
+       "route": /* some route handle tree */
+     }
+   ]
+ }
+
+
+{
+   "type" : "HashRoute",
+   "children" : "Pool|MyPool",
+   // additional options, e.g. hash function, salt, etc.
+ }
+等价于
+"HashRoute|Pool|MyPool"
+
+
+=========================================
+
+
+PrefixPolicyRoute
+{
+  "default_policy": "PoolRoute|A",
+  "operation_policies": {
+    "delete": {
+      "type": "AllSyncRoute",
+      "children": [ "PoolRoute|A", "PoolRoute|B" ]
+    }
+  }
+}
+
+所有get和set请求都会发布到Pool A。delete请求发布到Pool A和Poll B。
+operation_policies 支持get、set、delete。
+
+eg:
+{
+  "pools": {
+    "A": {
+      "servers": [
+        "127.0.0.1:11211"
+      ]
+    },
+    "B": {
+      "servers": [
+        "127.0.0.1:11212"
+      ]
+    },
+    "C": {
+      "servers": [
+        "127.0.0.1:11213"
+      ]
+    }
+  },
+  "route": {
+    "type": "PrefixPolicyRoute",
+    "default_policy": "PoolRoute|A",
+    "operation_policies": {
+      "delete": {
+        "type": "AllSyncRoute",
+        "children": [
+          "PoolRoute|A",
+          "PoolRoute|B"
+        ]
+      }
+    }
+  }
+}
+
+set到默认instance中，即Pool A
+# echo -ne "set bn 0 0 3\r\nqwe\r\n" | nc 0 5000
+STORED
+# echo -ne "get bn\r\n" | nc 0 11211
+VALUE bn 0 3
+qwe
+END
+# echo -ne "get bn\r\n" | nc 0 11212
+END
+
+在中set同样的key值
+# echo -ne "set bn 0 0 3\r\nqwe\r\n" | nc 0 11212
+STORED
+# echo -ne "get bn\r\n" | nc 0 11212
+VALUE bn 0 3
+qwe
+END
+
+删除该key，可以见到在两个instance中都删除掉了
+# echo -ne "delete bn\r\n" | nc 0 5000
+DELETED
+# echo -ne "get bn\r\n" | nc 0 11211
+END
+# echo -ne "get bn\r\n" | nc 0 11212
+END
+
+
+PoolRoute
+属性：pool、shadows、hash、rates
+
+MigrateRoute 应用场景？
+迁移模式路由，属性from，to，start_time,interval
+迁移模式路由执行过程：
+1、迁移开始前，将所有请求发布到from 路由中
+2、[start_time,(start_time+interval)]
+将所有请求(除了delete)发布到from，将所有delete请求发布到from和to，针对delete请求，返回两个route中最坏的一个
+3、[start_time+interval,start_time+2*interval]
+将所有请求(除了delete)发布到to，将所有delete请求发布到from和to，针对delete请求，返回两个route中最坏的一个
+4、[start_time+2*interval],所有请求都发布到to
+
+WarmUpRoute
+
+
+
+AllFastestRoute，属性children
+将请求发布到所有instances中，最先返回非错误的响应作为操作返回值，其它返回值被丢弃。
+AllInitialRoute，属性children
+将请求发布到所有instances中，等待第一个children中的响应并返回，其它操作异步执行。
+AllMajorityRoute，属性children
+将请求发布到所有instances中，直到有非错误的结果出现，返回最先的值。
+AllSyncRoute，属性children
+将请求发布到所有instances中，收集到所有结果，并返回最坏的一个。
+ErrorRoute
+每个请求都立即返回错误，可设定错误值。ErrorRoute|MyErrorValueHere。
+FailoverRoute
+failover模式，发布到第一个instance，若没有错，直接返回，否则发布到第二份instance。
+FailoverWithExptimeRoute
+在FailoverRoute之上添加了相关setting，比如超时。
+HashRoute
+根据key的hash值来路由，可加salt，指定hash_func以及weights
+HostIdRoute
+根据客户端hostId来路由
+LatestRoute
+根据failover_count来路由
+MissFailoverRoute
+针对get请求，若没命中，继续向另外的instance发请求，直到命中，若所有的都错误，返回最后一个值。
+NullRoute
+针对delete、get、set均返回not found。
+DevNullRoute
+同NullRoute，但会进入统计。
+
+
+=========================================
+
+
+Shared Pool：
+{
+  "pools": {
+    "A": {
+      "servers": [
+        "127.0.0.1:12345",
+        "[::1]:12346"
+      ]
+    }
+  },
+  "route": "PoolRoute|A"
+}
+所有请求都会路由到pool A中得两个instances。路由规则为key的一致性hash。这种类型同client直接连memcached实例效果一样。
+
+Replicated Pool：
+{
+   "pools": {
+      "A": {
+         "servers": [
+            // hosts of replicated pool, e.g.:
+           "127.0.0.1:12345",
+           "[::1]:12346"
+         ]
+      }
+   },
+   "route": {
+     "type": "PrefixPolicyRoute",
+     "operation_policies": {
+       "delete": "AllSyncRoute|Pool|A",
+       "add": "AllSyncRoute|Pool|A",
+       "get": "LatestRoute|Pool|A",
+       "set": "AllSyncRoute|Pool|A"
+     }
+   }
+ }
+ 所有更新请求会发布到pool中所有instances，读请求获取pool中表现最好的一个，若get失败了，会尝试从pool中另外一个instance读取数据，try_time=5。
+
+Prefix routing：
+ {
+   "pools": {
+     "workload1": { "servers": [ /* list of cache hosts for workload1 */ ] },
+     "workload2": { "servers": [ /* list of cache hosts for workload2 */ ] },
+     "common_cache": { "servers": [ /* list of cache hosts for common use */ ] }
+   },
+   "route": {
+     "type": "PrefixSelectorRoute",
+     "policies": {
+       "a": "PoolRoute|workload1",
+       "b": "PoolRoute|workload2"
+     },
+     "wildcard": "PoolRoute|common_cache"
+   }
+ }
+
+前缀选择路由主要是根据key来匹配的，上例中以a开头的key都会路由到workload1，以b开头的key杜辉路由到workload2，不匹配a/b前缀的路由到common_cache。
+
+Shadowing:
+{
+  "pools": {
+    "production": {
+      "servers": [ /* production hosts */ ]
+    },
+    "test": {
+      "servers": [ /* test hosts */ ]
+    }
+  },
+  "route": {
+    "type": "PoolRoute",
+    "pool": "production",
+    "shadows": [
+      {
+        "target": "PoolRoute|test",
+        // shadow traffic that would go to first and second hosts in 'production' pool
+        // note that the endpoint is non-inclusive
+        "index_range": [0, 2],
+        // shadow requests for 10% of keys based on key hash
+        "key_fraction_range": [0, 0.1]
+      }
+    ]
+  }
+}
+这种方式主要将线上cache同步导入到测试环境中，其实可以用于预热缓存。
+index_range中表示对0、1两个instances的缓存操作请求中有10%(由key_fraction_range决定)会同步更新到test pool中。
+
+Cold cache warm up：
+{
+   "pools": {
+     "cold": { "servers": [ /* cold hosts */ ] },
+     "warm": { "servers": [ /* warm hosts */ ] }
+   },
+   "route": {
+     "type": "WarmUpRoute",
+     "cold": "PoolRoute|cold",
+     "warm": "PoolRoute|warm"
+   }
+}
+缓存预热，该种方式所有更新操作会路由到cold pool，get操作会尝试从cold中读取，若失败了，从warm中读取，成功后会异步set到cold pool中。
+wiki说 “without impact on performance”。其实还是会有影响的，因为从cold pool get时，miss概率变大了。
+
+Multi cluster broadcast：
+{"pools":
+        {
+                "local_pool_in_first_cluster":{"servers":["127.0.0.1:11211"]},
+                "local_pool_in_second_cluster":{"servers":["127.0.0.1:11212"]},
+                "shared_pool":{"servers":["127.0.0.1:11213"]}
+        },
+"routes": [
+    {
+      "aliases": [
+        "/datacenter/cluster0/"
+      ],
+      "route": {
+        "type": "PrefixSelectorRoute",
+        "policies": {
+          "shr": "PoolRoute|shared_pool"
+        },
+        "wildcard": "PoolRoute|local_pool_in_first_cluster"
+      }
+    },
+    {
+      "aliases": [
+        "/datacenter/cluster1/"
+      ],
+      "route": {
+        "type": "PrefixSelectorRoute",
+        "policies": {
+          "shr": "PoolRoute|shared_pool"
+        },
+        "wildcard": "PoolRoute|local_pool_in_second_cluster"
+      }
+    }
+  ]
+}
+该种方式可以支持多个应用共享memcached，又能独立的使用应用特有的memcached。
+aliases指定了应用路由到哪个pool，由启动时参数-R指定。
+上述例子若key前缀匹配了shr，则会发布到share_pool，则两种路由方式都能读到数据。若不匹配，则从自己的pool中读取数据。
+
+eg:
+# /root/mcrouter-install/bin/mcrouter -f mcrouter_prefix.conf -p 5000 \
+	-b --file-observer-poll-period-ms=10 --file-observer-sleep-before-update-ms=20 -R /datacenter/cluster0/ 
+
+上面默认路由到/datacenter/cluster0/ 下的pool
+# echo -ne "set prefix 0 0 3\r\nabc\r\n" | nc 0 5000 
+# echo -ne "get prefix\r\n" | nc 0 5000 
+VALUE prefix 0 3
+abc
+END
+# echo -ne "get prefix\r\n" | nc 0 11211
+VALUE prefix 0 3
+abc
+END
+# echo -ne "get prefix\r\n" | nc 0 11212
+END
+# echo -ne "get /datacenter/cluster0/prefix\r\n" | nc 0 5000
+VALUE /datacenter/cluster0/prefix 0 3
+abc
+END
+# echo -ne "get /datacenter/cluster1/prefix\r\n" | nc 0 5000
+END
+
+set到共享缓存中，两种方式都能读到
+# echo -ne "set /datacenter/cluster1/shr:shr 0 0 3\r\n123\r\n" | nc 0 5000
+STORED
+# echo -ne "get /datacenter/cluster0/shr:shr\r\n" | nc 0 5000
+VALUE /datacenter/cluster0/shr:shr 0 3
+123
+END
+# echo -ne "get /datacenter/cluster1/shr:shr\r\n" | nc 0 5000
+VALUE /datacenter/cluster1/shr:shr 0 3
+123
+END
+
+
+=========================================
+
+Pattern matching:
+这个能够很好的解决多地区同步的问题，更新操作多地区，读取操作从本地区读取
+
+分别set key到不同的cluster
+# echo -ne "set /datacenter/cluster1/abc 0 0 3\r\n123\r\n" | nc 0 5000
+STORED
+# echo -ne "set /datacenter/cluster0/abc 0 0 3\r\n123\r\n" | nc 0 5000
+STORED
+发出一条正则删除指令，实际上它会同时发到两个cluster中
+# echo -ne "delete /datacenter/*/abc\r\n" | nc 0 5000
+DELETED
+# echo -ne "get /datacenter/cluster1/abc\r\n" | nc 0 5000
+END
+# echo -ne "get /datacenter/cluster0/abc\r\n" | nc 0 5000
+END
+
+同时set到两个cluster中
+# echo -ne "set /datacenter/*/ww 0 0 3\r\n123\r\n" | nc 0 5000
+STORED
+可以分别从每个cluster中读取数据
+# echo -ne "get /datacenter/cluster0/ww\r\n" | nc 0 5000
+VALUE /datacenter/cluster0/ww 0 3
+123
+END
+# echo -ne "get /datacenter/cluster1/ww\r\n" | nc 0 5000
+VALUE /datacenter/cluster1/ww 0 3
+123
+END
+
+
+=========================================
+
+宏定义，支持定义handle，支持jsonm
+{"pools":
+        {
+                "A":{"servers":["127.0.0.1:11211"]},
+                "B":{"servers":["127.0.0.1:11212"]},
+                "C":{"servers":["127.0.0.1:11213"]}
+        },
+"named_handles": [
+     {
+       "type": "PoolRoute",
+       "name": "ratedA",
+       "pool": "A",
+       "rates": {
+         "sets_rate" : 10
+       }
+     },
+     {
+       "type": "PoolRoute",
+       "name": "ratedB",
+       "pool": "B",
+       "rates": {
+         "sets_rate" : 10
+       }
+     }
+   ],
+"routes": [
+     {
+       "aliases": [ "/datacenter/cluster0/" ],
+       "route": {
+         "type": "FailoverRoute",
+         "children": [
+           "ratedA",
+           "ratedB",
+           "C"
+         ]
+       }
+     },
+     {
+       "aliases": [ "/datacenter/cluster1/" ],
+       "route": {
+         "type": "FailoverRoute",
+         "children": [
+           "ratedB",
+           "ratedA"
+         ]
+       }
+     }
+   ]
+}
+
+
+=========================================
+管理员命令
+get __mcrouter__.route(<op>,<key>)
+查询key的路由，找到key存在哪个instance了。
+# echo -ne "get __mcrouter__.route(set,bn)\r\n" | nc 0 5000
+VALUE __mcrouter__.route(set,bn) 0 15
+127.0.0.1:11211
+END
+
+get __mcrouter__.route_handles(set,mykey)
+查询路由处理拓扑
+# echo -ne "get __mcrouter__.route_handles(set,bn)\r\n" | nc 0 5000
+VALUE __mcrouter__.route_handles(set,bn) 0 109
+proxy
+ root
+  prefix-policy
+   asynclog
+    hash
+     host|pool=A|id=0|ssl=false|ap=127.0.0.1:11211:TCP:ascii
+END
+
+
+get __mcrouter__.preprocessed_config
+获取当前mcrouter服务已经load的配置
+
+
+=========================================
+统计相关
+除了memcached原生的stats命令，还支持group模式
+如：
+echo "stats all" | nc 0 5000
+echo "stats cmd" | nc 0 5000
+echo "stats cmd-in" | nc 0 5000
+echo "stats cmd-out" | nc 0 5000
+echo "stats cmd-error" | nc 0 5000
+
+# echo "stats servers" | nc 0 5000
+STAT 127.0.0.1:11211:TCP:ascii-1-0 avg_latency_us:487.730 new:1; deleted:1 found:1 stored:1
+STAT 127.0.0.1:11212:TCP:ascii-1-0 avg_latency_us:461.000 new:1; deleted:1
+END
+
