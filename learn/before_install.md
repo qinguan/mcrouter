@@ -9,9 +9,10 @@ glog-0.3.3.tar.gz
 gtest-1.6.0.zip  
 mcrouter.tar.gz  
 Python-2.7.6.tar.xz 
+install.sh
 
 2. install mcrouter
-#CPU_NUMBERS: default 2
+CPU_NUMBERS: default 2
 bash install.sh $INSTALL_DIR $CPU_NUMBERS
 
 
